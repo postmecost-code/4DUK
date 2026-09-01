@@ -102,11 +102,5 @@
 * Инструменты сборки: PlatformIO / Arduino IDE для компиляции прошивок периферии.
 
 
-
-
-
-
----
-
 ## ⏱️ Timers and Device Lifecycle
 
