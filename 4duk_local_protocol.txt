@@ -1,0 +1,210 @@
+### ===============================================================================
+SPECIFICATION OF THE 4DUK LOCAL NETWORK PROTOCOL (REVISION 1.3)
+
+1. INTRODUCTION AND ARCHITECTURAL PRINCIPLES
+
+This document describes the application-level protocol for local interaction
+between smart home devices within the 4DUK ecosystem. The protocol is designed
+for deployment in trusted local area networks (LAN/WLAN) within a single L2
+network segment. 
+
+Key Protocol Properties: 
+
+* Decentralization (Peer-to-Peer): All network nodes are equal; data exchange
+is fully asynchronous.
+* Event-Driven Model: Data transmission is triggered by changes in the
+physical state of the hardware.
+* Broadcast Transport: All messages are encapsulated in UDP Broadcast packets,
+minimizing overhead for session maintenance.
+* Passive Registration: The gateway automatically discovers and registers
+devices by intercepting their telemetry packets without dedicated
+discovery requests.
+
+1. NETWORK TRANSPORT PARAMETERS
+
+All network nodes (the control gateway and end-device execution modules) must
+configure their sockets with the following parameters: 
+
+* Protocol: UDP (User Datagram Protocol).
+* Network Port: 9009 (fixed for both transmitting and receiving).
+* Destination Address (Destination IP): 255.255.255.255 (Limited broadcast).
+* Data Encoding: UTF-8 or ASCII.
+* Network Requirements: Access Point / Client Isolation (AP Isolation) must
+be disabled on the Wi-Fi router.
+
+1. PACKET FORMAT AND SYNTAX
+
+All packets are plain text strings. Elements within a packet are strictly
+separated by a colon character (:). Spaces are not permitted unless they are
+part of the payload data. 
+
+The protocol defines three types of packets, identified by their prefix marker
+(the first element): 
+
+1. device   - Control packet (Gateway -> Network).
+2. devstate - Status/Telemetry packet (Device -> Network).
+3. devping  - Service network presence packet (Device -> Network).
+4. PACKET TYPE SPECIFICATIONS
+
+4.1. Control Packet (device)
+Sent by the gateway to change the physical or logical state of a target
+end-device. 
+
+Syntax:
+device:devname:action:actionname:value:data 
+
+Field Descriptions: 
+
+* device (const): Control payload marker.
+* devname (string): Unique system name of the target device in the network.
+* action (const): Action transmission indicator.
+* actionname (string): Technical name of the command/method to be executed.
+* value (const): Data transmission indicator.
+* data (string): The value or argument of the command.
+
+Example: device:relay_kitchen:action:power:value:on 
+
+4.2. Status and Telemetry Packet (devstate)
+Sent by a device to synchronize its current state with the gateway and other
+modules. Each capability or parameter of the device must be transmitted in
+a separate UDP packet. 
+
+Syntax:
+devstate:devname:statename:value 
+
+Field Descriptions: 
+
+* devstate (const): Status/Telemetry packet marker.
+* devname (string): System name of the transmitting device.
+* statename (string): Technical name of the reported parameter or capability.
+* value (string): Current value of the parameter.
+
+Example: devstate:relay_kitchen:power:on 
+
+4.3. Presence Service Packet (devping)
+Sent by a device to confirm its physical availability and update network routing
+parameters when no state changes occur. 
+
+Syntax:
+devping:devname:MAC:IP 
+
+Field Descriptions: 
+
+* devping (const): Presence/Keep-alive service packet marker.
+* devname (string): System name of the transmitting device.
+* MAC (string): Physical address of the device's network interface with all
+colons removed (12 characters, uppercase, e.g., AABBCCDDEEFF).
+* IP (string): Current local IPv4 address assigned to the device.
+
+Example: devping:relay_kitchen:001A2B3C4D5E:192.168.1.105 
+
+1. TIMERS AND DEVICE LIFECYCLE
+
+Power Applied            State Changed             Idle > 3 Minutes 
+
+|                         |                           |
+v                         v                           v
+[Bulk devstate]          [Instant devstate]          [Service devping]
+(Auto-Registration)       (Acknowledgement/Ack)      (Connection Control) 
+
+Device firmware developers must implement the following state machine logic: 
+
+5.1. Initialization (Cold Start) 
+
+* Upon power-up and successful network connection, the device ALWAYS
+generates and transmits individual devstate packets for all of its supported
+parameters sequentially.
+* By intercepting these initial packets, the gateway performs passive
+auto-registration of the new device in its local database.
+* The internal idle timer starts counting immediately after sending these
+initial packets.
+
+5.2. Asynchronous Command Acknowledgement 
+
+* Upon receiving a valid device packet matching its system name (or group mask),
+the device executes the physical action and INSTANTLY transmits the
+corresponding devstate packet with the updated value back into the network.
+This acts as an Acknowledgement (Ack) signal for the gateway.
+* Sending any devstate packet resets the internal idle timer back to 0.
+
+5.3. Network Status Control (Keep-Alive) 
+
+* If the state of the device does not change for 3 minutes (180 seconds)
+(meaning no devstate packets were generated), the device is required to
+send exactly one devping service packet.
+* Sending any devstate packet (triggered via network command or a local
+hardware button) resets this 3-minute idle countdown. Thus, devping packets
+are sent STRICTLY during periods of device inactivity.
+
+1. IMPLEMENTATION AND SOFTWARE ARCHITECTURE GUIDELINES
+
+6.1. Inbound Traffic Filtering
+Because packets are broadcast across the L2 segment, they hit every connected
+node on port 9009. To minimize CPU utilization on microcontrollers, inbound
+traffic must be filtered early using Regular Expressions (RegEx) or fast
+string-prefix validation. 
+
+* Packets that do not begin with device, devstate, or devping must be
+discarded immediately before parsing.
+* To support group actions (e.g., "turn off all lights on the kitchen"),
+filtering logic should accommodate group name masks or specific suffixes
+(e.g., *_all).
+
+6.2. Event Bus Design Pattern
+Packet processing inside devices and gateways should follow an asynchronous
+Observer / Event-Driven architecture: 
+
+1. Network Dispatcher (Router): Listens to port 9009, validates string syntax,
+and converts raw text strings into structured packet objects
+(DeviceCommand, DeviceStatus).
+2. Internal Event Bus: Distributes packet objects to registered, independent
+software sub-modules (e.g., physical relay driver, LED status indicator,
+local diagnostic logger).
+3. ERROR HANDLING AND CUSTOM DIAGNOSTICS (TRANSIT LOGS)
+
+7.1. Isolation of Errors
+Low-level error handling (e.g., short circuit protection, overcurrent,
+hardware PWM failures, out-of-bounds adjustments) RESTS ENTIRELY ON THE
+END-DEVICE SIDE and is managed natively by the developer's firmware. Devices
+handle protective cut-offs or value clamping independently. 
+
+7.2. Transparent Cloud Transit Logging via devstate
+Developers can leverage the standard devstate packet structure to pass custom
+diagnostic, debugging, or system analytics straight to the cloud server
+database. 
+
+Naming Rule: To prevent debugging variables from colliding with end-user smart
+home capabilities (such as power, brightness, volume), developers must use
+reserved system prefixes for the statename field (sys_, err_, or debug_). 
+
+Data Flow:
+[Device] --(UDP Broadcast:9009)--> [4DUK Gateway] --(Transit)--> [4DUK Server] 
+
+Examples of Diagnostic Packets: 
+
+* Critical Hardware Error Notification:
+devstate:relay_kitchen:sys_error:OVERHEAT_85C
+(The gateway transits the packet, and the skill server updates the row for
+relay_kitchen in the database, writing OVERHEAT_85C into the sys_error field.)
+* Network Health Diagnostic (Wi-Fi RSSI tracking):
+devstate:dimmer_lounge:debug_rssi:-68dBm
+* Device Continuous Uptime Broadcast (in seconds):
+devstate:stb_bedroom:sys_uptime:86400
+
+7.3. Architectural Benefits 
+
+* Schemaless Field Updates: The gateway and skill server treat transit fields
+dynamically. If a developer introduces a new debugging key (e.g.,
+debug_mem_free), it populates the cloud database automatically without
+changing the gateway software.
+* Unified Remote Debugging: Developers do not need physical access to hardware
+diagnostic interfaces (UART/JTAG) during field testing. Any telemetry string
+sent to the local broadcast port becomes viewable directly inside the
+provider's server console logs.
+
+Reserved Developer Prefixes: 
+
+* sys_*   - System metrics (uptime, chip temperature, firmware version).
+* err_*   - System fault codes or textual error logs.
+* debug_* - Arbitrary string output for testing and QA validation.
+===============================================================================
