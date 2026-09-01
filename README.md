@@ -1,75 +1,110 @@
-# 4DUK Local Network Protocol Specification (Revision 1.3)
+## 4DUK Smart Home System
+[](docs/protocol_spec.md)
+[](LICENSE)
 
-This repository contains the official, implementation-agnostic application-level protocol specification for local interaction between smart home devices within the **4DUK** ecosystem. 
+Репозиторий содержит исходный код, конфигурации и архитектурные спецификации децентрализованной событийно-ориентированной системы автоматизации умного дома 4DUK.
+Проект построен на низкоуровневом кастомном стеке (Nginx + PostgreSQL) с использованием Unix IPC-моделей. Система объединяет классическое управление устройствами (Smart Home API) и диалоговые NLP-навыки (с возможностью динамического синтеза устройств на лету) в единой транзакционной среде СУБД.
+------------------------------
+## 🏗 Архитектура системы
+Архитектура разделена на три изолированных контура безопасности и обмена данными, оптимизированных для минимального сетевого оверхеда:
 
-The protocol is designed for seamless, high-performance deployment in trusted local area networks (LAN/WLAN) within a single L2 network segment.
+                  [ Внешние Интеграции: Алиса / Салют / Маруся ]
+                                        │
+                                        │ (Голосовые Вебхуки, порт 443)
+                                        ▼
+                                   [ Nginx ] ──► (Маркировка через client_id)
+                                        │
+                                        ▼ (Сырой JSON + Маркер подсистемы)
+┌───────────────────────────────────────────────────────────────────────────────────────┐
+│ PostgreSQL (Единое Топологическое Ядро обработки)                                     │
+│                                                                                       │
+│  ┌───────────────────────────────┐                 ┌───────────────────────────────┐  │
+│  │    Умный Дом (Smart Home)     │                 │ Диалоговые Навыки (Dialogues) │  │
+│  │ (Обработка команд и статусов) │                 │   (Динамический синтез, NLP)  │  │
+│  └───────────────┬───────────────┘                 └───────────────┬───────────────┘  │
+│                  │                                                 │                  │
+│                  └───────────────────────┬─────────────────────────┘                  │
+│                                          ▼                                            │
+│               [ Унифицированная Авторизация и Логический Роутинг ]                    │
+└──────────────────────────────────────────┬────────────────────────────────────────────┘
+                                           │ (Shared Memory + Сигналы)
+                                           ▼
+┌───────────────────────────────────────────────────────────────────────────────────────┐
+│ Сервер шлюзов (Мастер-процесс, порт TCP 9009)                                         │
+│                  ├── fork() ──► [Дочерний процесс Пользователя А]                    │
+└──────────────────────────────────────────┬────────────────────────────────────────────┘
+                                           │ (Полностью прозрачный TCP, порт 9009)
+                                           ▼
+                               [ Локальный Шлюз (Порт 9009) ]
+                                           │
+                                           ▼ (UDP Broadcast, порт 9009)
+                             [ Локальные устройства: ESP / RPi ]
 
-## 🚀 Architectural Principles
+## 1. Локальный контур (Peer-to-Peer)
+Внутренние устройства (ESP32, ESP8266, Raspberry Pi) общаются между собой и со шлюзом напрямую через UDP Broadcast (порт 9009). Локальная автоматизация полностью автономна, децентрализована и работает мгновенно без участия сервера и интернета.
+## 2. Сквозной изолированный транспорт (Шлюз ◄► Сервер)
 
-* **Decentralization (Peer-to-Peer):** All network nodes are equal; data exchange is fully asynchronous without strict master-slave blocking constraints.
-* **Event-Driven Model:** Data transmission is instantly triggered by changes in the physical or logical state of the hardware.
-* **Broadcast Transport:** All messages are encapsulated in lightweight UDP Broadcast packets, eliminating session maintenance overhead.
-* **Passive Registration:** The 4DUK control gateway automatically discovers and registers devices by intercepting their telemetry or keep-alive packets without dedicated discovery polling sequences.
+* Многопроцессная изоляция (fork): Мастер-процесс сервера шлюзов слушает TCP-порт 9009. При подключении пользовательского шлюза вызывается fork(), изолируя сессию на уровне ядра ОС. Падение или компрометация одного процесса физически не влияет на остальных пользователей.
+* Абсолютная прозрачность: Сервер шлюзов работает в режиме raw-прокси. Он не парсит пакеты, а мгновенно перекладывает сырой текстовый поток в разделяемую память (Shared Memory) и отправляет системный сигнал в СУБД PostgreSQL.
 
----
+## 3. Серверное ядро (PostgreSQL + Nginx)
 
-## 📡 Network Transport Parameters
+* Nginx (Reverse Proxy): Принимает HTTPS-вебхуки от голосовых платформ (Яндекс Алиса, Сбер Салют, VK Маруся). Параметр client_id в конфигурации Nginx используется как жесткий маркер подсистемы.
+* PostgreSQL: Единственная точка интерпретации данных. СУБД решает дуальную задачу: обеспечивает сквозную стандартизированную авторизацию внешних платформ, одновременно разделяя трафик Smart Home API и текстовые реплики диалогов. Разделение пользователей внутри СУБД контролируется на уровне изолированных схем или политик Row-Level Security (RLS).
 
-All network nodes (gateways, controllers, and end-device execution modules) must configure their sockets according to the following baseline parameters:
+------------------------------
+## 📡 Локальный сетевой протокол (v1.3)
+Обмен данными внутри LAN/WLAN на порту UDP 9009 стандартизирован в виде plain-text строк, разделенных двоеточием (:). Протокол содержит 3 типа пакетов:
 
-| Parameter | Value | Description |
-| :--- | :--- | :--- |
-| **Protocol** | UDP | User Datagram Protocol |
-| **Network Port** | `9009` | Fixed destination port for both transmitting and receiving |
-| **Destination Address** | `255.255.255.255` | Limited broadcast address (local subnet) |
-| **Data Encoding** | UTF-8 / ASCII | Raw text strings |
-| **Topology Requirement** | AP Isolation Disabled | Client isolation must be deactivated on the Wi-Fi router |
+* Управление (device): device:devname:action:actionname:value:data
+Пример: device:relay_kitchen:action:power:value:on
+* Статус и телеметрия (devstate): devstate:devname:statename:value
+Пример: devstate:relay_kitchen:power:on
+* Присутствие / Keep-Alive (devping): devping:devname:MAC:IP
+Пример: devping:relay_kitchen:001A2B3C4D5E:192.168.1.105
 
----
+## Жизненный цикл и таймеры
 
-## 🔤 Packet Format & Syntax
+   1. Cold Start: При включении питания устройство отправляет пакеты devstate последовательно по всем своим параметрам. Шлюз перехватывает их и производит пассивную авторегистрацию в БД.
+   2. Асинхронное квитирование (Ack): При получении команды device модуль исполняет ее и мгновенно возвращает в сеть обновленный devstate, подтверждая выполнение.
+   3. Контроль присутствия: Если состояние устройства не меняется в течение 3 минут (180 сек), оно отправляет одиночный пакет devping. Любая отправка devstate сбрасывает этот таймер в ноль.
 
-All packets are plain text strings. Elements within a packet are strictly separated by a colon character (`:`). Spaces are **not permitted** unless they are part of the target payload data.
+------------------------------
+## 🔌 Кастомная медиа-интеграция и транзит логов
+В систему глубоко интегрированы программно-аппаратные решения для управления и мониторинга состояния IPTV-приставок (декодеров) через ИК-бластеры на базе ESP:
 
-The protocol defines three core types of packets, strictly identified by their first element (prefix marker):
-1. `device` — Control command packet (**Gateway ➔ Network**).
-2. `devstate` — Status/Telemetry packet (**Device ➔ Network**).
-3. `devping` — Service network presence/keep-alive packet (**Device ➔ Network**).
+* SML-482 / SML-282 / SML-292
+* MAG-250
+* Motorola VIP1003
 
-### 1. Control Packet (`device`)
-Sent by the central gateway to change the physical or logical state of a target end-device execution module.
+## Прозрачное сквозное логирование ошибок
+Разработчики периферии могут пробрасывать отладочные метрики напрямую в облачную СУБД через стандартные пакеты devstate. Для изоляции от пользовательских функций умного дома используются зарезервированные системные префиксы в поле statename:
 
-* **Syntax:** `device:devname:action:actionname:value:data`
-* **Fields:**
-  * `device` *(const)*: Control payload marker.
-  * `devname` *(string)*: Unique system name of the target device in the local network.
-  * `action` *(const)*: Action transmission indicator.
-  * `actionname` *(string)*: Technical name of the command/method to be executed (e.g., `power`, `brightness`).
-  * `value` *(const)*: Data transmission indicator.
-  * `data` *(string)*: The argument or target value of the command (e.g., `on`, `off`, `50`).
-* **Example:** `device:relay_kitchen:action:power:value:on`
+* sys_* — Системные метрики (аптайм, температура чипа). Пример: devstate:stb_bedroom:sys_uptime:86400
+* err_* — Коды сбоев и текстовые логи. Пример: devstate:relay_kitchen:err_code:OVERHEAT_85C
+* debug_* — Произвольный вывод для тестирования. Пример: devstate:dimmer_lounge:debug_rssi:-68dBm
 
-### 2. Status and Telemetry Packet (`devstate`)
-Sent by an end-device to synchronize its current state with the gateway and other listening nodes. Each capability or parameter of the device must be transmitted in a separate individual UDP packet.
+Преимущество (Schemaless Field Updates): Сервер шлюзов и СУБД обрабатывают транзитные поля динамически через неструктурированный тип данных JSONB. При добавлении новых отладочных ключей в прошивку ESP они автоматически создаются в базе данных сервера без изменения серверного кода.
+------------------------------
+## 🗣 Мета-автоматизация: Синтез устройств через диалоги
+Поскольку диалоговая NLP-подсистема имеет общий контекст и прямой доступ к таблицам мета-описания умного дома в PostgreSQL, система поддерживает динамический синтез устройств прямо во время беседы:
 
-* **Syntax:** `devstate:devname:statename:value`
-* **Fields:**
-  * `devstate` *(const)*: Status/Telemetry packet marker.
-  * `devname` *(string)*: System name of the transmitting device.
-  * `statename` *(string)*: Technical name of the reported parameter or capability.
-  * `value` *(string)*: Current value of the parameter.
-* **Example:** `devstate:relay_kitchen:power:on`
+* Пользователь в свободном текстовом или голосовом формате просит ассистента создать виртуальный сценарий, связать устройства или добавить новую логическую абстракцию.
+* Диалоговый навык через хранимые процедуры PL/pgSQL на лету инициализирует новую сущность в конфигурации умного дома.
+* Синтезированное устройство мгновенно регистрируется в Smart Home API, пробрасывается в интерфейсы Алисы, Салюта или Маруси и начинает коммуницировать с локальной сетью по прозрачному TCP/UDP-каналу на порту 9009.
 
-### 3. Presence Service Packet (`devping`)
-Sent by an end-device to confirm its physical availability, prevent timeout flags, and update network routing tables when no state changes occur.
+------------------------------
+## 🚀 Требования к серверному окружению
 
-* **Syntax:** `devping:devname:MAC:IP`
-* **Fields:**
-  * `devping` *(const)*: Presence/Keep-alive service packet marker.
-  * `devname` *(string)*: System name of the transmitting device.
-  * `MAC` *(string)*: Physical address of the device's network interface with all colons removed (**12 characters, uppercase**, e.g., `AABBCCDDEEFF`).
-  * `IP` *(string)*: Current local IPv4 address assigned to the device.
-* **Example:** `devping:relay_kitchen:001A2B3C4D5E:192.168.1.105`
+* Операционная система: Linux / Unix (с поддержкой POSIX сигналов и fork).
+* СУБД: PostgreSQL версии 14 или выше (рекомендуется поддержка работы с JSONB).
+* Веб-сервер: Nginx с поддержкой SSL-терминации.
+* Инструменты сборки: PlatformIO / Arduino IDE для компиляции прошивок периферии.
+
+
+
+
+
 
 ---
 
